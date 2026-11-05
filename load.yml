@@ -31,7 +31,7 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: gcp-key.json
           # --- TODO: studenci uzupełniają poniższe trzy wartości ---
           BQ_PROJECT_ID: ljm
-          BQ_DATASET: inzynieria-danych-ljm
+          BQ_DATASET: ljm
           BQ_TABLE: ljm
         run: python extract_load.py
 
