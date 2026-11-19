@@ -1,51 +1,149 @@
 """
-Extract & Load: Neon (PostgreSQL) -> BigQuery
+Extract & Load (sekwencyjny wg relacji PK -> FK): Neon (PostgreSQL) -> BigQuery
 
-Ten skrypt jest uruchamiany przez GitHub Actions (patrz .github/workflows/load.yml).
-Zmienne środowiskowe (NEON_CONNECTION_STRING, BQ_PROJECT_ID, BQ_DATASET, BQ_TABLE)
-są ustawiane w kroku workflow, na podstawie GitHub Secrets.
-
-Studenci uzupełniają / modyfikują sekcję "KONFIGURACJA" poniżej.
+Skrypt automatycznie odczytuje relacje kluczy obcych z bazy Neon,
+wyznacza kolejność ładowania (sortowanie topologiczne) i ładuje tabele
+sekwencyjnie: od tabel nadrzędnych (PK) do podrzędnych (FK).
 """
 
+import heapq
 import os
-import psycopg2
+from collections import defaultdict
+
 import pandas as pd
+import psycopg2
+from psycopg2 import sql
 from google.cloud import bigquery
 
 # ============================================================
-# KONFIGURACJA -- tu wprowadzacie zmiany na labie
+# KONFIGURACJA
 # ============================================================
 
 NEON_CONNECTION_STRING = os.environ["NEON_CONNECTION_STRING"]
 BQ_PROJECT_ID = os.environ["BQ_PROJECT_ID"]
 BQ_DATASET = os.environ["BQ_DATASET"]
-BQ_TABLE = os.environ["BQ_TABLE"]
+BQ_TABLE_PREFIX = os.getenv("BQ_TABLE_PREFIX", "")
 
-# TODO: nazwa tabeli źródłowej w Neon (ta, którą wypełnialiście w Lab 1)
-SOURCE_TABLE = "appointments"
+DB_SCHEMA = os.getenv("DB_SCHEMA", "public")
+DEFAULT_LOAD_MODE = os.getenv("DEFAULT_LOAD_MODE", "incremental")
+DEFAULT_INCREMENTAL_COLUMN = os.getenv("DEFAULT_INCREMENTAL_COLUMN", "updated_at")
 
-# TODO: kolumna używana do wykrywania nowych/zmienionych wierszy przy incremental load
-INCREMENTAL_COLUMN = "updated_at"
+EXCLUDE_TABLES = {
+    t.strip() for t in os.getenv("EXCLUDE_TABLES", "").split(",") if t.strip()
+}
 
-# TODO: "full_refresh" -> zawsze ładuje wszystko od nowa (nadpisuje tabelę w BigQuery)
-#       "incremental"  -> ładuje tylko wiersze nowsze niż ostatnio załadowane
-LOAD_MODE = "incremental"
+# Opcjonalne nadpisania dla konkretnych tabel (klucz = nazwa tabeli w Neon).
+# Jeśli tabela nie jest tu wpisana, użyje ustawień domyślnych powyżej.
+TABLE_CONFIG = {
+    # Przykład dla tabeli słownikowej bez kolumny updated_at:
+    # "specializations": {"load_mode": "full_refresh"},
+    # Przykład z inną kolumną przyrostową lub docelową nazwą w BigQuery:
+    # "appointments": {
+    #     "load_mode": "incremental",
+    #     "incremental_column": "updated_at",
+    #     "bq_table": "appointments",
+    # },
+}
 
 # ============================================================
-# LOGIKA -- zwykle nie trzeba tego modyfikować
+# ANALIZA RELACJI PK-FK I SORTOWANIE TOPOLOGICZNE
 # ============================================================
 
 
-def get_last_loaded_timestamp(bq_client: bigquery.Client, table_ref: str):
-    """Odczytuje maksymalny timestamp już obecny w tabeli docelowej BigQuery.
+def fetch_schema_metadata(conn, schema: str):
+    """Pobiera listę tabel, ich kolumny oraz krawędzie zależności (parent -> child)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT tablename
+            FROM pg_tables
+            WHERE schemaname = %s
+            ORDER BY tablename;
+            """,
+            (schema,),
+        )
+        tables = [row[0] for row in cur.fetchall() if row[0] not in EXCLUDE_TABLES]
 
-    Używane tylko w trybie incremental -- pozwala wyciągnąć z Neon
-    wyłącznie wiersze nowsze niż to, co już wcześniej załadowano.
-    Jeśli tabela w BigQuery jeszcze nie istnieje, zwraca None
-    (co w praktyce oznacza "załaduj wszystko").
-    """
-    query = f"SELECT MAX({INCREMENTAL_COLUMN}) AS max_ts FROM `{table_ref}`"
+        cur.execute(
+            """
+            SELECT table_name, column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s;
+            """,
+            (schema,),
+        )
+        columns_by_table = defaultdict(set)
+        for table_name, col_name in cur.fetchall():
+            columns_by_table[table_name].add(col_name)
+
+        # Relacje FK (pomijamy self-referencing FK, żeby nie blokować sortowania)
+        cur.execute(
+            """
+            SELECT DISTINCT
+                parent_tbl.relname AS parent_table,
+                child_tbl.relname AS child_table
+            FROM pg_constraint con
+            JOIN pg_class child_tbl ON child_tbl.oid = con.conrelid
+            JOIN pg_namespace child_ns ON child_ns.oid = child_tbl.relnamespace
+            JOIN pg_class parent_tbl ON parent_tbl.oid = con.confrelid
+            JOIN pg_namespace parent_ns ON parent_ns.oid = parent_tbl.relnamespace
+            WHERE con.contype = 'f'
+              AND child_ns.nspname = %s
+              AND parent_ns.nspname = %s
+              AND child_tbl.relname <> parent_tbl.relname;
+            """,
+            (schema, schema),
+        )
+        fk_edges = cur.fetchall()
+
+    return tables, columns_by_table, fk_edges
+
+
+def topological_sort_tables(tables: list[str], fk_edges: list[tuple[str, str]]) -> list[str]:
+    """Wyznacza kolejność ładowania tabel od rodziców (PK) do dzieci (FK) algorytmem Kahna."""
+    table_set = set(tables)
+    in_degree = {t: 0 for t in tables}
+    children = {t: set() for t in tables}
+
+    for parent, child in fk_edges:
+        if parent in table_set and child in table_set:
+            if child not in children[parent]:
+                children[parent].add(child)
+                in_degree[child] += 1
+
+    # Min-heap zapewnia deterministyczną kolejność (alfabetyczną w ramach tego samego poziomu)
+    ready = [t for t in tables if in_degree[t] == 0]
+    heapq.heapify(ready)
+
+    ordered = []
+    while ready:
+        current = heapq.heappop(ready)
+        ordered.append(current)
+        for child in children[current]:
+            in_degree[child] -= 1
+            if in_degree[child] == 0:
+                heapq.heappush(ready, child)
+
+    if len(ordered) != len(tables):
+        cyclic = sorted(table_set - set(ordered))
+        raise RuntimeError(
+            f"Wykryto cykliczną zależność FK między tabelami: {', '.join(cyclic)}. "
+            "Rozwiąż cykl lub wyklucz wybrane tabele w EXCLUDE_TABLES."
+        )
+
+    return ordered
+
+
+# ============================================================
+# LOGIKA EXTRACT & LOAD
+# ============================================================
+
+
+def get_last_loaded_timestamp(
+    bq_client: bigquery.Client, table_ref: str, incremental_col: str
+):
+    """Odczytuje maksymalny timestamp już obecny w tabeli docelowej BigQuery."""
+    query = f"SELECT MAX(`{incremental_col}`) AS max_ts FROM `{table_ref}`"
     try:
         result = bq_client.query(query).result()
         row = next(iter(result))
@@ -54,28 +152,34 @@ def get_last_loaded_timestamp(bq_client: bigquery.Client, table_ref: str):
         return None
 
 
-def extract_from_neon(mode: str, last_ts=None) -> pd.DataFrame:
-    """Łączy się z bazą Neon i wyciąga dane z tabeli źródłowej."""
-    conn = psycopg2.connect(NEON_CONNECTION_STRING)
-    try:
-        if mode == "incremental" and last_ts is not None:
-            query = f"SELECT * FROM {SOURCE_TABLE} WHERE {INCREMENTAL_COLUMN} > %s"
-            df = pd.read_sql(query, conn, params=(last_ts,))
-        else:
-            query = f"SELECT * FROM {SOURCE_TABLE}"
-            df = pd.read_sql(query, conn)
-    finally:
-        conn.close()
-    return df
+def extract_from_neon(
+    conn,
+    schema: str,
+    table_name: str,
+    mode: str,
+    incremental_col: str | None = None,
+    last_ts=None,
+) -> pd.DataFrame:
+    """Wyciąga dane z pojedynczej tabeli w Neon."""
+    if mode == "incremental" and incremental_col and last_ts is not None:
+        query = sql.SQL("SELECT * FROM {}.{} WHERE {} > %s").format(
+            sql.Identifier(schema),
+            sql.Identifier(table_name),
+            sql.Identifier(incremental_col),
+        )
+        return pd.read_sql(query.as_string(conn), conn, params=(last_ts,))
+
+    query = sql.SQL("SELECT * FROM {}.{}").format(
+        sql.Identifier(schema),
+        sql.Identifier(table_name),
+    )
+    return pd.read_sql(query.as_string(conn), conn)
 
 
-def load_to_bigquery(df: pd.DataFrame, table_ref: str, mode: str):
-    """Ładuje DataFrame do BigQuery.
-
-    full_refresh -> WRITE_TRUNCATE (nadpisuje całą tabelę)
-    incremental  -> WRITE_APPEND   (dopisuje nowe wiersze)
-    """
-    bq_client = bigquery.Client()
+def load_to_bigquery(
+    bq_client: bigquery.Client, df: pd.DataFrame, table_ref: str, mode: str
+):
+    """Ładuje DataFrame do BigQuery (WRITE_TRUNCATE lub WRITE_APPEND)."""
     write_disposition = (
         bigquery.WriteDisposition.WRITE_TRUNCATE
         if mode == "full_refresh"
@@ -83,28 +187,59 @@ def load_to_bigquery(df: pd.DataFrame, table_ref: str, mode: str):
     )
     job_config = bigquery.LoadJobConfig(write_disposition=write_disposition)
     job = bq_client.load_table_from_dataframe(df, table_ref, job_config=job_config)
-    job.result()  # czeka na zakończenie load jobu
+    job.result()
     return job
 
 
 def main():
-    table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
-    bq_client = bigquery.Client()
+    bq_client = bigquery.Client(project=BQ_PROJECT_ID)
+    conn = psycopg2.connect(NEON_CONNECTION_STRING)
 
-    last_ts = None
-    if LOAD_MODE == "incremental":
-        last_ts = get_last_loaded_timestamp(bq_client, table_ref)
-        print(f"Ostatni załadowany timestamp w BigQuery: {last_ts}")
+    try:
+        tables, columns_by_table, fk_edges = fetch_schema_metadata(conn, DB_SCHEMA)
+        if not tables:
+            print(f"Brak tabel do załadowania w schemacie '{DB_SCHEMA}'.")
+            return
 
-    df = extract_from_neon(LOAD_MODE, last_ts)
-    print(f"Wyciągnięto {len(df)} wierszy z Neon (tabela źródłowa: {SOURCE_TABLE})")
+        load_order = topological_sort_tables(tables, fk_edges)
+        print(f"Kolejność ładowania (PK -> FK): {' -> '.join(load_order)}")
 
-    if df.empty:
-        print("Brak nowych danych do załadowania -- kończę.")
-        return
+        for index, source_table in enumerate(load_order, start=1):
+            cfg = TABLE_CONFIG.get(source_table, {})
+            mode = cfg.get("load_mode", DEFAULT_LOAD_MODE)
+            incremental_col = cfg.get("incremental_column", DEFAULT_INCREMENTAL_COLUMN)
+            bq_table_name = cfg.get("bq_table", f"{BQ_TABLE_PREFIX}{source_table}")
+            table_ref = f"{BQ_PROJECT_ID}.{BQ_DATASET}.{bq_table_name}"
 
-    job = load_to_bigquery(df, table_ref, LOAD_MODE)
-    print(f"Załadowano {job.output_rows} wierszy do {table_ref} (tryb: {LOAD_MODE})")
+            print(f"\n[{index}/{len(load_order)}] Tabela: {source_table} -> {table_ref}")
+
+            # Fallback: jeśli tabela nie posiada kolumny przyrostowej, przełącz na full_refresh
+            if mode == "incremental" and incremental_col not in columns_by_table[source_table]:
+                print(
+                    f"  Uwaga: brak kolumny '{incremental_col}' w '{source_table}' "
+                    "-- przełączam na full_refresh."
+                )
+                mode = "full_refresh"
+
+            last_ts = None
+            if mode == "incremental":
+                last_ts = get_last_loaded_timestamp(bq_client, table_ref, incremental_col)
+                print(f"  Ostatni załadowany timestamp ({incremental_col}): {last_ts}")
+
+            df = extract_from_neon(
+                conn, DB_SCHEMA, source_table, mode, incremental_col, last_ts
+            )
+            print(f"  Wyciągnięto {len(df)} wierszy z Neon (tryb: {mode})")
+
+            if df.empty:
+                print("  Brak nowych danych -- pomijam ładowanie.")
+                continue
+
+            job = load_to_bigquery(bq_client, df, table_ref, mode)
+            print(f"  Załadowano {job.output_rows} wierszy do {table_ref}")
+
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
