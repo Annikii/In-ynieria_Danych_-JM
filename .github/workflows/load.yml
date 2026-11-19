@@ -30,7 +30,7 @@ jobs:
           NEON_CONNECTION_STRING: ${{ secrets.NEON_API_KEY }}
           GOOGLE_APPLICATION_CREDENTIALS: gcp-key.json
           # --- TODO: studenci uzupełniają poniższe trzy wartości ---
-          BQ_PROJECT_ID: inzynieria-danych-LJM
+          BQ_PROJECT_ID: inzynieria-danych-ljm
           BQ_DATASET: ljm
           BQ_TABLE: ljm
         run: python extract_load.py
