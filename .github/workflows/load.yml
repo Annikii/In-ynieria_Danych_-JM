@@ -1,10 +1,19 @@
 name: Load data from Neon to BigQuery
 
-# Uruchamiane ręcznie (do testów na labie) lub wg harmonogramu
+# Uruchamiane ręcznie (z możliwością wyboru trybu) lub wg harmonogramu
 on:
-  workflow_dispatch:      # pozwala odpalić workflow ręcznie z zakładki Actions
+  workflow_dispatch:
+    inputs:
+      load_mode:
+        description: 'Domyślny tryb ładowania (incremental / full_refresh)'
+        required: false
+        default: 'incremental'
+        type: choice
+        options:
+          - incremental
+          - full_refresh
   schedule:
-    - cron: '0 6 * * *'   # przykładowy harmonogram: codziennie o 6:00 UTC
+    - cron: '0 6 * * *'   # codziennie o 6:00 UTC
 
 jobs:
   extract-and-load:
@@ -25,14 +34,21 @@ jobs:
       - name: Write GCP service account key to file
         run: echo '${{ secrets.GCP_SA_KEY }}' > gcp-key.json
 
-      - name: Run extract and load script
+      - name: Run sequential extract and load script (PK -> FK)
         env:
           NEON_CONNECTION_STRING: ${{ secrets.NEON_API_KEY }}
           GOOGLE_APPLICATION_CREDENTIALS: gcp-key.json
-          # --- TODO: studenci uzupełniają poniższe trzy wartości ---
+          # Konfiguracja celu w BigQuery (każda tabela z Neon trafi pod swoją nazwą do datasetu)
           BQ_PROJECT_ID: inzynieria-danych-ljm
           BQ_DATASET: ljm
-          BQ_TABLE: ljm
+          # Opcjonalny prefiks nazw tabel w BigQuery (np. "raw_"), zostaw pusty dla nazw 1:1
+          BQ_TABLE_PREFIX: ""
+          # Konfiguracja źródła w Neon
+          DB_SCHEMA: public
+          DEFAULT_LOAD_MODE: ${{ inputs.load_mode || 'incremental' }}
+          DEFAULT_INCREMENTAL_COLUMN: updated_at
+          # Opcjonalne filtrowanie (nazwy rozdzielone przecinkami, np. "alembic_version,tmp_logs")
+          EXCLUDE_TABLES: ""
         run: python extract_load.py
 
       - name: Clean up key file
